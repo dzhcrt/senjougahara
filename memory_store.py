@@ -7,7 +7,7 @@ import logging
 import re
 import sqlite3
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -23,6 +23,8 @@ class MemoryEntry:
     content: str
     importance: int
     updated_at: str
+    evidence_count: int = 1
+    last_confirmed_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -62,10 +64,17 @@ class MemoryStore:
                     content TEXT NOT NULL,
                     importance INTEGER NOT NULL DEFAULT 3,
                     updated_at TEXT NOT NULL,
+                    evidence_count INTEGER NOT NULL DEFAULT 1,
+                    last_confirmed_at TEXT NOT NULL DEFAULT '',
                     UNIQUE(chat_id, memory_key)
                 )
                 """
             )
+            columns = {row[1] for row in self.connection.execute("PRAGMA table_info(chat_memory)")}
+            if "evidence_count" not in columns:
+                self.connection.execute("ALTER TABLE chat_memory ADD COLUMN evidence_count INTEGER NOT NULL DEFAULT 1")
+            if "last_confirmed_at" not in columns:
+                self.connection.execute("ALTER TABLE chat_memory ADD COLUMN last_confirmed_at TEXT NOT NULL DEFAULT ''")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_chat_memory_priority "
                 "ON chat_memory(chat_id, importance DESC, updated_at DESC)"
@@ -82,6 +91,8 @@ class MemoryStore:
             content=str(row["content"]),
             importance=int(row["importance"]),
             updated_at=str(row["updated_at"]),
+            evidence_count=int(row["evidence_count"]) if "evidence_count" in row.keys() else 1,
+            last_confirmed_at=str(row["last_confirmed_at"]) if "last_confirmed_at" in row.keys() else str(row["updated_at"]),
         )
 
     @staticmethod
@@ -95,7 +106,7 @@ class MemoryStore:
         rows = self.connection.execute(
             """
             SELECT memory_key, owner_user_id, subject, category, content,
-                   importance, updated_at
+                   importance, updated_at, evidence_count, last_confirmed_at
             FROM chat_memory
             WHERE chat_id = ?
             ORDER BY importance DESC, updated_at DESC, id DESC
@@ -134,7 +145,8 @@ class MemoryStore:
     ) -> int:
         """Apply validated model suggestions; return number of changed rows."""
         changed = 0
-        now = datetime.now(timezone.utc).isoformat()
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
         existing_rows = self.connection.execute(
             "SELECT memory_key, owner_user_id FROM chat_memory WHERE chat_id = ?",
             (chat_id,),
@@ -199,32 +211,45 @@ class MemoryStore:
                 if not content or len(content) < 5:
                     continue
 
+                evidence_level = str(getattr(item, "evidence_level", "tentative"))
                 old = self.connection.execute(
-                    """SELECT owner_user_id, subject, category, content, importance
+                    """SELECT owner_user_id, subject, category, content, importance,
+                              evidence_count, last_confirmed_at
                        FROM chat_memory WHERE chat_id = ? AND memory_key = ?""",
                     (chat_id, key),
                 ).fetchone()
-                if old is not None and (
-                    old["subject"] == subject
-                    and old["category"] == category
-                    and old["content"] == content
-                    and int(old["importance"]) == importance
-                ):
-                    continue
+                evidence_count = 2 if evidence_level == "strong" else 1
+                last_confirmed_at = now
+                if old is not None:
+                    same_fact = old["category"] == category and old["subject"] == subject
+                    if same_fact and evidence_level in {"repeated", "strong"}:
+                        evidence_count = int(old["evidence_count"] or 1) + 1
+                        last_confirmed_at = now
+                        # Repeated independent evidence stabilizes the memory.
+                        importance = max(importance, min(5, int(old["importance"]) + 1))
+                    else:
+                        evidence_count = int(old["evidence_count"] or 1)
+                        last_confirmed_at = str(old["last_confirmed_at"] or old["updated_at"])
+                    if (old["subject"] == subject and old["category"] == category
+                        and old["content"] == content and int(old["importance"]) == importance
+                        and evidence_level == "tentative"):
+                        continue
 
                 self.connection.execute(
                     """
                     INSERT INTO chat_memory
                         (chat_id, memory_key, owner_user_id, subject, category,
-                         content, importance, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         content, importance, updated_at, evidence_count, last_confirmed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(chat_id, memory_key) DO UPDATE SET
                         owner_user_id = excluded.owner_user_id,
                         subject = excluded.subject,
                         category = excluded.category,
                         content = excluded.content,
                         importance = excluded.importance,
-                        updated_at = excluded.updated_at
+                        updated_at = excluded.updated_at,
+                        evidence_count = excluded.evidence_count,
+                        last_confirmed_at = excluded.last_confirmed_at
                     """,
                     (
                         chat_id,
@@ -235,11 +260,14 @@ class MemoryStore:
                         content,
                         importance,
                         now,
+                        evidence_count,
+                        last_confirmed_at,
                     ),
                 )
                 existing[key] = owner_id
                 changed += 1
 
+        self._cleanup_stale(chat_id, now_dt)
         self._trim(chat_id)
         return changed
 
@@ -247,7 +275,7 @@ class MemoryStore:
         rows = self.connection.execute(
             """
             SELECT id, memory_key, owner_user_id, subject, category, content,
-                   importance, updated_at
+                   importance, updated_at, evidence_count, last_confirmed_at
             FROM chat_memory
             WHERE chat_id = ?
             ORDER BY importance DESC, updated_at DESC, id DESC
@@ -277,6 +305,24 @@ class MemoryStore:
                     self.connection.execute(
                         "DELETE FROM chat_memory WHERE chat_id = ?", (chat_id,)
                     )
+
+    def _cleanup_stale(self, chat_id: int, now: datetime) -> None:
+        """Decay weak, unconfirmed inferences; preserve repeatedly confirmed memories."""
+        cutoff = (now - timedelta(days=120)).isoformat()
+        very_old = (now - timedelta(days=240)).isoformat()
+        with self.connection:
+            # Tentative low-value notes expire first. Strong/repeated notes are stable.
+            self.connection.execute(
+                "DELETE FROM chat_memory WHERE chat_id = ? AND importance <= 2 "
+                "AND evidence_count <= 1 AND COALESCE(last_confirmed_at, updated_at) < ?",
+                (chat_id, cutoff),
+            )
+            # Old medium-value notes are removed only if they were never reinforced.
+            self.connection.execute(
+                "DELETE FROM chat_memory WHERE chat_id = ? AND importance = 3 "
+                "AND evidence_count <= 1 AND COALESCE(last_confirmed_at, updated_at) < ?",
+                (chat_id, very_old),
+            )
 
     def forget_user(self, chat_id: int, user_id: int) -> int:
         with self.connection:
