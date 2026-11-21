@@ -32,7 +32,7 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "./data/senjougahara.sqlite3").strip()
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
 CONTEXT_MESSAGES = int(os.getenv("CONTEXT_MESSAGES", "20"))
