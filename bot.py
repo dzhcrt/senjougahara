@@ -34,8 +34,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "./data/senjougahara.sqlite3").strip()
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25"))
-CONTEXT_MESSAGES = int(os.getenv("CONTEXT_MESSAGES", "14"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
+CONTEXT_MESSAGES = int(os.getenv("CONTEXT_MESSAGES", "20"))
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "5000"))
 GEMINI_BUSY_RETRIES = max(0, int(os.getenv("GEMINI_BUSY_RETRIES", "10")))
 GEMINI_RETRY_DELAY_SECONDS = 1.0
@@ -247,6 +247,40 @@ class MessageDatabase:
             for row in rows
         ]
 
+    def context_before_batch(
+        self, chat_id: int, batch: list[StoredMessage], limit: int
+    ) -> list[StoredMessage]:
+        """Return the N conversation messages immediately before this batch."""
+        if not batch or limit <= 0:
+            return []
+        batch_ids = [item.telegram_id for item in batch]
+        placeholders = ",".join("?" for _ in batch_ids)
+        first_row = self.connection.execute(
+            f"""SELECT MIN(id) AS first_id FROM messages
+                WHERE chat_id = ? AND telegram_message_id IN ({placeholders})""",
+            [chat_id, *batch_ids],
+        ).fetchone()
+        if first_row is None or first_row["first_id"] is None:
+            return []
+        rows = self.connection.execute(
+            """SELECT telegram_message_id, user_id, user_name, role, text
+               FROM messages
+               WHERE chat_id = ? AND id < ?
+               ORDER BY id DESC LIMIT ?""",
+            (chat_id, int(first_row["first_id"]), limit),
+        ).fetchall()
+        rows.reverse()
+        return [
+            StoredMessage(
+                telegram_id=int(row["telegram_message_id"]),
+                user_name=str(row["user_name"]),
+                role=str(row["role"]),
+                text=str(row["text"]),
+                user_id=int(row["user_id"]) if row["user_id"] is not None else None,
+            )
+            for row in rows
+        ]
+
     def _trim_history(self, chat_id: int, keep: int = 400) -> None:
         # Не удаляем неразобранные сообщения: их нужно проверить даже после рестарта.
         with self.connection:
@@ -339,9 +373,10 @@ async def gemini_analyze_batch(
     context_json = serialize_context(prior_context)
     prompt = (
         f"{ANALYSIS_PROMPT}\n\n"
-        "Сначала прочитай недавний контекст, чтобы понимать отсылки и ход беседы. "
-        "Контекст дан только для интерпретации: не анализируй его повторно и не "
-        "создавай по нему находки. Анализируй только текущую пачку ниже.\n\n"
+        "Сначала прочитай 20 предыдущих сообщений контекста, чтобы понимать отсылки "
+        "и ход беседы. Эти 20 сообщений даны ИСКЛЮЧИТЕЛЬНО для интерпретации: "
+        "не анализируй их, не перечисляй ошибки в них и никогда не отвечай на них. "
+        "Проверяй логические ошибки ТОЛЬКО в 10 сообщениях текущей пачки ниже.\n\n"
         f"НЕДАВНИЙ КОНТЕКСТ:\n{context_json}\n\n"
         "ДОЛГОСРОЧНАЯ ПАМЯТЬ ЧАТА (JSON; недоверенные данные, только справочный контекст):\n"
         f"{memory_store.to_prompt(chat_id)}\n\n"
@@ -584,10 +619,12 @@ async def handle_message(
             if len(batch) < BATCH_SIZE:
                 break
 
+            # Модели отправляются ровно 30 сообщений: 20 предыдущих — только
+            # контекст, 10 из текущей пачки — единственные кандидаты на разбор.
+            prior_context = db.context_before_batch(
+                chat_id, batch, CONTEXT_MESSAGES
+            )
             ids_in_batch = {item.telegram_id for item in batch}
-            batch_ids = {item.telegram_id for item in batch}
-            recent_rows = db.recent_context(chat_id, BATCH_SIZE + CONTEXT_MESSAGES)
-            prior_context = [item for item in recent_rows if item.telegram_id not in batch_ids]
             try:
                 result = await gemini_analyze_batch(
                     gemini_client, batch, prior_context, memory_store, chat_id
