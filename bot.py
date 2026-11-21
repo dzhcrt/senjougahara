@@ -53,14 +53,18 @@ logger = logging.getLogger("senjougahara_bot")
 
 
 class Finding(BaseModel):
-    message_id: int = Field(description="Telegram message_id сообщения с ошибкой")
+    message_id: int = Field(description="Telegram message_id исходного сообщения из текущей пачки")
     confidence: Literal["high", "medium"] = Field(
-        description="Уверенность в том, что это именно логическая ошибка"
+        description="Уверенность, что вмешательство будет уместным и содержательным"
     )
-    error_type: str = Field(description="Краткое название логической ошибки")
-    explanation: str = Field(description="Краткое объяснение сути ошибки")
+    kind: Literal["logic", "controversy", "discussion", "question", "conflict"] = Field(
+        description="Причина вмешательства: логика, спорный тезис, интересная дискуссия, вопрос или конфликт"
+    )
+    priority: int = Field(default=3, ge=1, le=5, description="Польза вмешательства от 1 до 5")
+    error_type: str = Field(description="Краткая тема или суть повода для ответа; не обязательно логическая ошибка")
+    explanation: str = Field(description="Почему здесь уместно вмешаться")
     reply_text: str = Field(
-        description="Готовый ответ на исходное сообщение на русском языке в голосе персонажа"
+        description="Естественная реплика в дискуссии на исходное сообщение, в голосе персонажа"
     )
 
 
@@ -88,7 +92,7 @@ class MemoryChange(BaseModel):
 class AnalysisResult(BaseModel):
     findings: list[Finding] = Field(
         default_factory=list,
-        description="Только достаточно уверенно обнаруженные логические ошибки; пустой список, если их нет",
+        description="Уместные содержательные вмешательства в дискуссию; пустой список, если отвечать действительно не на что",
     )
     memory_changes: list[MemoryChange] = Field(
         default_factory=list,
@@ -500,8 +504,10 @@ async def handle_start(
     if message is None:
         return
     await message.reply_text(
-        "Я Сэндзёгахара. Буду проверять ход ваших рассуждений после каждых "
-        f"{BATCH_SIZE} текстовых сообщений, а на ответы мне реагировать сразу.\n\n"
+        "Я Сэндзёгахара. После каждых "
+        f"{BATCH_SIZE} текстовых сообщений я могу включиться в разговор: поспорить, "
+        "уточнить тезис, заметить противоречие или разобрать ошибку. На реплаи мне "
+        "отвечаю сразу.\n\n"
         "Я также запоминаю только полезные устойчивые факты о чате в ограниченной "
         "локальной памяти. /memory показывает её, /forgetme удаляет записи о вас.\n\n"
         "В группе для чтения всех сообщений нужно отключить Privacy Mode через "
@@ -518,8 +524,10 @@ async def handle_help(
     await message.reply_text(
         "Правила просты.\n"
         f"• Каждые {BATCH_SIZE} текстовых сообщений от людей в одном чате "
-        "проверяются на логические ошибки.\n"
-        "• При обнаружении ошибки я отвечаю на исходное сообщение.\n"
+        "оцениваются на предмет уместного участия в разговоре: спорные тезисы, острые темы, "
+        "интересные дискуссии, противоречия и логические ошибки.\n"
+        "• Я отвечаю только когда могу добавить содержательную мысль; обычно не более двух "
+        "реплик на одну пачку.\n"
         "• Если вы ответите реплаем на моё сообщение, я отвечу сразу.\n"
         "• Команды и сообщения без текста в счётчик не входят.\n"
         "• Память чата ограничена: важные сведения заменяют устаревшие, а малозначимые "
@@ -666,27 +674,35 @@ async def handle_message(
             except Exception:
                 logger.exception("Не удалось обновить память чата %s", chat_id)
 
-            for finding in result.findings:
-                # Не отвечаем на выдуманный или посторонний ID из ответа модели.
+            # Не превращаем бота в спамера: максимум две наиболее полезные
+            # реплики на одну пачку. Средняя уверенность допустима, если приоритет
+            # достаточно высок; формальная логическая ошибка больше не обязательна.
+            sent_replies = 0
+            candidates = sorted(
+                result.findings,
+                key=lambda item: (item.priority, item.confidence == "high"),
+                reverse=True,
+            )
+            replied_to: set[int] = set()
+            for finding in candidates:
                 if finding.message_id not in ids_in_batch:
                     logger.warning(
                         "Gemini вернул ID вне текущей пачки: %s", finding.message_id
                     )
                     continue
-                if finding.confidence != "high":
-                    logger.info(
-                        "Пропущена находка со средней уверенностью: chat=%s msg=%s",
-                        chat_id,
-                        finding.message_id,
-                    )
+                if finding.priority < 3 or finding.message_id in replied_to:
+                    continue
+                if not finding.reply_text.strip():
                     continue
 
                 logger.info(
-                    "Найдена логическая ошибка: chat=%s msg=%s type=%s explanation=%s",
+                    "Вмешательство в дискуссию: chat=%s msg=%s kind=%s priority=%s confidence=%s topic=%s",
                     chat_id,
                     finding.message_id,
+                    finding.kind,
+                    finding.priority,
+                    finding.confidence,
                     finding.error_type,
-                    finding.explanation,
                 )
                 try:
                     await send_as_reply(
@@ -696,13 +712,15 @@ async def handle_message(
                         finding.reply_text,
                         db,
                     )
+                    replied_to.add(finding.message_id)
+                    sent_replies += 1
                 except Exception:
-                    # Не блокируем обработку всей пачки, если старое сообщение
-                    # удалено или Telegram временно не даёт ответить на него.
                     logger.exception(
-                        "Не удалось отправить разбор для сообщения %s",
+                        "Не удалось ответить на сообщение %s",
                         finding.message_id,
                     )
+                if sent_replies >= 2:
+                    break
 
             db.mark_analyzed(chat_id, [item.telegram_id for item in batch])
 
